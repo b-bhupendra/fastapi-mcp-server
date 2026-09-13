@@ -126,7 +126,9 @@ def inspect_git_status(repo_path: str) -> Dict[str, Any]:
         }
 
     branch = run_cmd(["git", "branch", "--show-current"], cwd=repo_path) or "main"
-    remote = run_cmd(["git", "remote", "get-url", "origin"], cwd=repo_path) or ""
+    raw_remote = run_cmd(["git", "remote", "get-url", "origin"], cwd=repo_path) or ""
+    import re
+    remote = re.sub(r"https://[^@]+@", "https://", raw_remote)
     dirty_out = run_cmd(["git", "status", "--porcelain"], cwd=repo_path)
     dirty_count = len(dirty_out.splitlines()) if dirty_out else 0
 
