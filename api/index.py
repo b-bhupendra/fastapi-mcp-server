@@ -1,6 +1,7 @@
 import os
 import json
 import datetime
+import fnmatch
 from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, Response
@@ -8,7 +9,7 @@ from fastapi.responses import JSONResponse, Response
 app = FastAPI(
     title="Project Intelligence MCP Server (Pinecone Cloud RAG)",
     description="Centralized Project Intelligence and RAG platform with Pinecone Vector DB for Gemini Spark",
-    version="2.0.0"
+    version="2.1.0"
 )
 
 # Auto-load .env file if present
@@ -24,6 +25,7 @@ if os.path.exists(env_file):
 PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY", "")
 PINECONE_INDEX_NAME = os.environ.get("PINECONE_INDEX_NAME", "project-intelligence")
 SYNC_SECRET = os.environ.get("SYNC_SECRET", "dev-sync-key")
+MCP_ACCESS_TOKEN = os.environ.get("MCP_ACCESS_TOKEN", "")
 
 # In-memory backup / fallback catalog for instant availability
 PROJECTS_CATALOG: Dict[str, Dict[str, Any]] = {
@@ -38,7 +40,7 @@ PROJECTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "dirty_files_count": 0,
         "priority_score": 90,
         "consensus_summary": "Production-grade Model Context Protocol (MCP) server running on Vercel Serverless. Connects to Pinecone DB for centralized project RAG, enabling Gemini Spark to search, prioritize, and analyze repositories.",
-        "key_files": ["api/index.py", "requirements.txt", "vercel.json", "scanner/scanner.py"],
+        "key_files": ["api/index.py", "requirements.txt", "vercel.json", "scanner/scanner.py", "scanner/daemon.py"],
         "last_scanned": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "chunks": [
             {
@@ -49,6 +51,29 @@ PROJECTS_CATALOG: Dict[str, Dict[str, Any]] = {
         ]
     }
 }
+
+def verify_token(request: Request) -> bool:
+    """Verifies Bearer token, query param, or header token."""
+    if not MCP_ACCESS_TOKEN:
+        # If no token configured in environment, allow access
+        return True
+
+    # 1. Header: Authorization: Bearer <token>
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        if auth.replace("Bearer ", "").strip() == MCP_ACCESS_TOKEN:
+            return True
+
+    # 2. Query param: ?token=<token>
+    query_token = request.query_params.get("token", "")
+    if query_token and query_token == MCP_ACCESS_TOKEN:
+        return True
+
+    # 3. Custom Header: X-MCP-Token or X-API-Key
+    if request.headers.get("X-MCP-Token") == MCP_ACCESS_TOKEN or request.headers.get("X-API-Key") == MCP_ACCESS_TOKEN:
+        return True
+
+    return False
 
 def get_pinecone_index():
     """Initializes and returns Pinecone index if configured."""
@@ -170,16 +195,70 @@ TOOLS = [
             },
             "required": ["project_name"]
         }
+    },
+    {
+        "name": "search_project_files",
+        "description": "Search for files, paths, or code patterns across the tracked repositories for Gemini Spark.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "File name, glob pattern (e.g. '*.py', 'index*'), or keyword to find."
+                },
+                "project_name": {
+                    "type": "string",
+                    "description": "Optional: restrict search to a specific repository."
+                }
+            },
+            "required": ["pattern"]
+        }
+    },
+    {
+        "name": "read_project_file",
+        "description": "Fetch the contents of a specific file from a repository to enable Gemini Spark to inspect implementation details.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_name": {
+                    "type": "string",
+                    "description": "Name of the project."
+                },
+                "file_path": {
+                    "type": "string",
+                    "description": "Relative path to the file within the repository (e.g. 'api/index.py')."
+                },
+                "max_lines": {
+                    "type": "integer",
+                    "description": "Maximum lines of code to retrieve (default: 100).",
+                    "default": 100
+                }
+            },
+            "required": ["project_name", "file_path"]
+        }
+    },
+    {
+        "name": "get_scanner_status",
+        "description": "Check the health, sync timestamp, and Pinecone vector count of the background ingestion scanner.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
     }
 ]
 
 @app.get("/")
-def home():
+def home(request: Request):
     index_connected = bool(PINECONE_API_KEY)
+    auth_ok = verify_token(request)
     return {
         "status": "online",
         "service": "Project Intelligence MCP Server",
-        "version": "2.0.0",
+        "version": "2.1.0",
+        "security": {
+            "auth_enabled": bool(MCP_ACCESS_TOKEN),
+            "authenticated": auth_ok
+        },
         "central_storage": "Pinecone DB",
         "pinecone_configured": index_connected,
         "pinecone_index": PINECONE_INDEX_NAME if index_connected else "pending PINECONE_API_KEY",
@@ -199,11 +278,14 @@ def health():
     return {
         "status": "healthy",
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "pinecone_ready": bool(PINECONE_API_KEY)
+        "pinecone_ready": bool(PINECONE_API_KEY),
+        "auth_configured": bool(MCP_ACCESS_TOKEN)
     }
 
 @app.get("/api/projects")
-def get_projects():
+def get_projects(request: Request):
+    if not verify_token(request):
+        raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing token")
     return {
         "total": len(PROJECTS_CATALOG),
         "projects": list(PROJECTS_CATALOG.values())
@@ -212,11 +294,11 @@ def get_projects():
 @app.post("/api/sync")
 async def sync_projects(request: Request):
     """Sync endpoint for local Dual-Ollama scanner to push enriched project dossiers."""
-    auth_header = request.headers.get("Authorization", "")
-    token = auth_header.replace("Bearer ", "").strip()
-    if SYNC_SECRET and token != SYNC_SECRET and request.headers.get("X-Sync-Key") != SYNC_SECRET:
-        # In dev mode allow if no secret set
-        pass
+    if not verify_token(request):
+        # Fallback to SYNC_SECRET
+        auth_header = request.headers.get("Authorization", "").replace("Bearer ", "").strip()
+        if not (SYNC_SECRET and (auth_header == SYNC_SECRET or request.headers.get("X-Sync-Key") == SYNC_SECRET)):
+            raise HTTPException(status_code=401, detail="Unauthorized sync request")
 
     try:
         data = await request.json()
@@ -242,11 +324,26 @@ async def sync_projects(request: Request):
 
 # MCP JSON-RPC Handler
 async def handle_mcp_request(request: Request) -> Response:
+    # Verify Token Auth
+    if not verify_token(request):
+        return JSONResponse(
+            {
+                "jsonrpc": "2.0",
+                "error": {
+                    "code": -32000,
+                    "message": "Unauthorized: Invalid or missing MCP access token. Provide 'Authorization: Bearer <token>' header or '?token=<token>' query parameter."
+                },
+                "id": None
+            },
+            status_code=401
+        )
+
     if request.method == "GET":
         return JSONResponse({
             "name": "project-intelligence-mcp",
-            "version": "2.0.0",
+            "version": "2.1.0",
             "protocolVersion": "2024-11-05",
+            "security": "Bearer Token Protected",
             "storage": "Pinecone DB",
             "tools": TOOLS
         })
@@ -274,8 +371,9 @@ async def handle_mcp_request(request: Request) -> Response:
                 },
                 "serverInfo": {
                     "name": "project-intelligence-mcp",
-                    "version": "2.0.0",
-                    "centralRepo": "Pinecone DB"
+                    "version": "2.1.0",
+                    "centralRepo": "Pinecone DB",
+                    "security": "Authenticated"
                 }
             }
         })
@@ -326,19 +424,15 @@ def execute_tool(tool_name: str, args: Dict[str, Any]) -> str:
         top_k = args.get("top_k", 5)
         filter_synced = args.get("filter_synced")
         
-        # Check Pinecone
         pinecone_index = get_pinecone_index()
         if pinecone_index:
             try:
-                # Query Pinecone using Integrated Inference or query_vector
                 metadata_filter = {}
                 if filter_synced is not None:
                     metadata_filter["is_synced"] = filter_synced
                 
-                # If Pinecone has integrated embeddings or query vectors
-                # Fallback to metadata search or vector search
                 res = pinecone_index.query(
-                    vector=[0.0] * 768, # dummy if using metadata filter only
+                    vector=[0.0] * 768,
                     top_k=top_k,
                     filter=metadata_filter if metadata_filter else None,
                     include_metadata=True
@@ -350,10 +444,8 @@ def execute_tool(tool_name: str, args: Dict[str, Any]) -> str:
                         meta = m.get("metadata", {})
                         score = m.get("score", 0.0)
                         output.append(f"- **Project**: `{meta.get('project_name')}` (Score: {score:.3f})")
-                        output.append(f"  - **Tech Stack**: {', '.join(meta.get('tech_stack', []))}")
+                        output.append(f"  - **Tech Stack**: {meta.get('tech_stack', 'N/A')}")
                         output.append(f"  - **Summary**: {meta.get('consensus_summary', 'N/A')}")
-                        if meta.get("content_chunk"):
-                            output.append(f"  - **Relevant Chunk**: {meta.get('content_chunk')[:300]}...")
                         output.append("")
                     return "\n".join(output)
             except Exception as e:
@@ -378,10 +470,7 @@ def execute_tool(tool_name: str, args: Dict[str, Any]) -> str:
             output.append(f"- **Git Status**: {'✅ Clean / Synced' if p.get('is_synced') else '⚠️ Unpushed / Dirty'}")
             output.append(f"- **Tech Stack**: {', '.join(p.get('tech_stack', []))}")
             output.append(f"- **Summary**: {p.get('consensus_summary', '')}")
-            output.append(f"- **GitHub Remote**: {p.get('git_remote', 'N/A')}")
             output.append("")
-        if not PINECONE_API_KEY:
-            output.append("\n> *Note: Pinecone DB is operating in synchronized memory cache mode. Set `PINECONE_API_KEY` in Vercel for live high-dimensional vector similarity.*")
         return "\n".join(output)
 
     # 2. List Projects
@@ -413,7 +502,6 @@ def execute_tool(tool_name: str, args: Dict[str, Any]) -> str:
         project_name = args.get("project_name", "")
         proj = PROJECTS_CATALOG.get(project_name)
         if not proj:
-            # Case-insensitive lookup
             for k, v in PROJECTS_CATALOG.items():
                 if k.lower() == project_name.lower():
                     proj = v
@@ -504,9 +592,85 @@ def execute_tool(tool_name: str, args: Dict[str, Any]) -> str:
 
 #### Architectural Chunks & Evidence:
 {chunk_text if chunk_text else 'Primary architecture defined in root modules.'}
+"""
 
-#### Guidance for Gemini Spark:
-Use the context above to produce an authoritative architectural evaluation, recommend architectural patterns, verify dependencies, or guide next implementation steps.
+    # 7. Search Project Files (Head Tool)
+    elif tool_name == "search_project_files":
+        pattern = args.get("pattern", "*")
+        proj_filter = args.get("project_name")
+        matches = []
+
+        for name, p in PROJECTS_CATALOG.items():
+            if proj_filter and name.lower() != proj_filter.lower():
+                continue
+            files = p.get("key_files", [])
+            for f in files:
+                if fnmatch.fnmatch(f.lower(), f"*{pattern.lower()}*"):
+                    matches.append((name, f))
+
+        if not matches:
+            return f"No files matching pattern '{pattern}' found in indexed repositories."
+
+        res = [f"### 🔎 Found {len(matches)} files matching '{pattern}':\n"]
+        for p_name, f_path in matches:
+            res.append(f"- **`{p_name}`**: `{f_path}`")
+        return "\n".join(res)
+
+    # 8. Read Project File (Head Tool)
+    elif tool_name == "read_project_file":
+        project_name = args.get("project_name", "")
+        file_path = args.get("file_path", "")
+        max_lines = args.get("max_lines", 100)
+
+        # 1. Try reading from local filesystem if accessible
+        local_base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        candidate_paths = [
+            os.path.join(local_base, file_path),
+            os.path.join(os.path.dirname(local_base), project_name, file_path)
+        ]
+        file_content = None
+        for cp in candidate_paths:
+            if os.path.isfile(cp):
+                try:
+                    with open(cp, "r", encoding="utf-8", errors="ignore") as f:
+                        lines = [f.readline() for _ in range(max_lines)]
+                        file_content = "".join(lines)
+                        break
+                except Exception:
+                    pass
+
+        if file_content:
+            return f"""### 📄 File: `{project_name}/{file_path}`\n```\n{file_content}\n```"""
+
+        # 2. Fallback to cached chunks in Pinecone/Catalog
+        proj = PROJECTS_CATALOG.get(project_name)
+        if proj:
+            for c in proj.get("chunks", []):
+                if file_path.lower() in c.get("id", "").lower():
+                    return f"### 📄 Cached Preview for `{project_name}/{file_path}`:\n```\n{c.get('text', '')}\n```"
+
+        return f"File '{file_path}' in project '{project_name}' not accessible directly."
+
+    # 9. Get Scanner Status (Head Tool)
+    elif tool_name == "get_scanner_status":
+        pinecone_index = get_pinecone_index()
+        vec_count = 0
+        p_status = "Not Connected"
+        if pinecone_index:
+            try:
+                stats = pinecone_index.describe_index_stats()
+                vec_count = stats.get("total_vector_count", 0)
+                p_status = "Connected & Active"
+            except Exception as e:
+                p_status = f"Error: {e}"
+
+        return f"""### 🤖 Ingestion Scanner & System Status
+- **Central Storage**: Pinecone DB (`{PINECONE_INDEX_NAME}`)
+- **Pinecone Status**: {p_status}
+- **Total Indexed Vectors**: {vec_count}
+- **Tracked Repositories**: {len(PROJECTS_CATALOG)}
+- **Server Authentication**: {'✅ Token Protected' if MCP_ACCESS_TOKEN else '⚠️ Unprotected'}
+- **Current Server Time**: {datetime.datetime.now(datetime.timezone.utc).isoformat()}
 """
 
     return f"Tool '{tool_name}' executed."

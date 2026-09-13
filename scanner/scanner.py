@@ -307,6 +307,36 @@ def calculate_priority_score(git_info: Dict[str, Any]) -> int:
     score += min(git_info.get("dirty_files_count", 0) * 2, 10)
     return min(max(score, 1), 100)
 
+def scan_repository(repo_path: str, progress_cb=None) -> Tuple[Dict[str, Any], List[float]]:
+    git_info = inspect_git_status(repo_path)
+    ctx = extract_project_context(repo_path)
+    summary = run_dual_ollama_consensus(ctx, progress_cb=progress_cb)
+    priority = calculate_priority_score(git_info)
+    vector_text = f"Project: {ctx['project_name']}. {summary} Stack: {', '.join(ctx['tech_stack'])}"
+    embedding = call_ollama_embed(vector_text)
+
+    proj_data = {
+        "project_name": ctx["project_name"],
+        "primary_language": ctx["primary_language"],
+        "tech_stack": ctx["tech_stack"],
+        "git_remote": git_info["git_remote"],
+        "git_branch": git_info["git_branch"],
+        "is_synced": git_info["is_synced"],
+        "unpushed_commits": git_info["unpushed_commits"],
+        "dirty_files_count": git_info["dirty_files_count"],
+        "last_commit_date": git_info["last_commit_date"],
+        "priority_score": priority,
+        "consensus_summary": summary,
+        "key_files": ctx["top_files"],
+        "embedding_dim": len(embedding),
+        "last_scanned": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "chunks": [
+            {"id": f"{ctx['project_name']}:overview", "text": summary, "type": "consensus_summary"},
+            {"id": f"{ctx['project_name']}:readme", "text": ctx["readme_preview"][:800], "type": "readme_chunk"}
+        ]
+    }
+    return proj_data, embedding
+
 def upsert_to_pinecone(projects: List[Dict[str, Any]], embeddings: List[List[float]]) -> bool:
     """Upserts projects and embeddings to Pinecone DB."""
     if not PINECONE_API_KEY:
