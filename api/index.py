@@ -302,6 +302,71 @@ def health():
         "auth_configured": bool(MCP_ACCESS_TOKEN)
     }
 
+OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", "gemini-spark")
+OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", MCP_ACCESS_TOKEN or "sec_mcp_spark_815b1e2aeb04702157366063e557a2362a89225d")
+
+@app.api_route("/oauth/token", methods=["GET", "POST"])
+@app.api_route("/token", methods=["GET", "POST"])
+async def oauth_token_endpoint(request: Request):
+    """OAuth 2.0 Token endpoint supporting client_credentials for Gemini Connected Apps."""
+    client_id = None
+    client_secret = None
+
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Basic "):
+        import base64
+        try:
+            decoded = base64.b64decode(auth_header.replace("Basic ", "").strip()).decode("utf-8")
+            if ":" in decoded:
+                client_id, client_secret = decoded.split(":", 1)
+        except Exception:
+            pass
+
+    content_type = request.headers.get("content-type", "")
+    if "application/x-www-form-urlencoded" in content_type:
+        try:
+            form = await request.form()
+            client_id = client_id or form.get("client_id")
+            client_secret = client_secret or form.get("client_secret")
+        except Exception:
+            pass
+    elif "application/json" in content_type:
+        try:
+            body = await request.json()
+            client_id = client_id or body.get("client_id")
+            client_secret = client_secret or body.get("client_secret")
+        except Exception:
+            pass
+
+    client_id = client_id or request.query_params.get("client_id")
+    client_secret = client_secret or request.query_params.get("client_secret")
+
+    expected_secret = OAUTH_CLIENT_SECRET
+    if (client_id == OAUTH_CLIENT_ID and client_secret == expected_secret) or (client_secret == expected_secret) or (not expected_secret):
+        return {
+            "access_token": expected_secret or "open_access_token",
+            "token_type": "Bearer",
+            "expires_in": 2592000
+        }
+
+    return JSONResponse(
+        {"error": "invalid_client", "error_description": "Invalid client ID or client secret"},
+        status_code=401
+    )
+
+@app.get("/.well-known/oauth-authorization-server")
+@app.get("/.well-known/openid-configuration")
+def oauth_metadata(request: Request):
+    base_url = str(request.base_url).rstrip("/")
+    return {
+        "issuer": base_url,
+        "token_endpoint": f"{base_url}/oauth/token",
+        "authorization_endpoint": f"{base_url}/oauth/authorize",
+        "response_types_supported": ["token"],
+        "grant_types_supported": ["client_credentials"],
+        "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"]
+    }
+
 @app.get("/api/projects")
 def get_projects(request: Request):
     if not verify_token(request):
