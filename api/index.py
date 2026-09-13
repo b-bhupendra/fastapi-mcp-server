@@ -39,6 +39,12 @@ PROJECTS_CATALOG: Dict[str, Dict[str, Any]] = {
         "unpushed_commits": 0,
         "dirty_files_count": 0,
         "priority_score": 90,
+        "intended_objective": "Build a high-performance Model Context Protocol (MCP) server on Vercel Serverless with Pinecone DB central vector knowledge to empower Gemini Spark to inspect, prioritize, and analyze all local repositories.",
+        "project_status": "Production-Ready",
+        "next_steps": [
+            "Configure Vercel environment variables with MCP_ACCESS_TOKEN and PINECONE_API_KEY",
+            "Connect Gemini Spark or Cursor client via /mcp endpoint"
+        ],
         "consensus_summary": "Production-grade Model Context Protocol (MCP) server running on Vercel Serverless. Connects to Pinecone DB for centralized project RAG, enabling Gemini Spark to search, prioritize, and analyze repositories.",
         "key_files": ["api/index.py", "requirements.txt", "vercel.json", "scanner/scanner.py", "scanner/daemon.py"],
         "last_scanned": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -243,6 +249,20 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {}
+        }
+    },
+    {
+        "name": "get_project_objective",
+        "description": "Retrieve specifically what a project repository was trying to achieve, its intended problem statement, current implementation lifecycle status, and recommended next steps.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_name": {
+                    "type": "string",
+                    "description": "Exact name of the project repository."
+                }
+            },
+            "required": ["project_name"]
         }
     }
 ]
@@ -671,6 +691,61 @@ def execute_tool(tool_name: str, args: Dict[str, Any]) -> str:
 - **Tracked Repositories**: {len(PROJECTS_CATALOG)}
 - **Server Authentication**: {'✅ Token Protected' if MCP_ACCESS_TOKEN else '⚠️ Unprotected'}
 - **Current Server Time**: {datetime.datetime.now(datetime.timezone.utc).isoformat()}
+"""
+
+    # 10. Get Project Objective (Head Tool specifically for Gemini Spark)
+    elif tool_name == "get_project_objective":
+        project_name = args.get("project_name", "")
+        proj = PROJECTS_CATALOG.get(project_name)
+        if not proj:
+            for k, v in PROJECTS_CATALOG.items():
+                if k.lower() == project_name.lower():
+                    proj = v
+                    break
+
+        if not proj:
+            pinecone_index = get_pinecone_index()
+            if pinecone_index:
+                try:
+                    res = pinecone_index.query(
+                        vector=[0.0] * 768,
+                        top_k=1,
+                        filter={"project_name": project_name},
+                        include_metadata=True
+                    )
+                    matches = res.get("matches", [])
+                    if matches:
+                        meta = matches[0].get("metadata", {})
+                        obj = meta.get("intended_objective") or meta.get("consensus_summary", "No objective recorded.")
+                        status = meta.get("project_status", "In Development")
+                        return f"""### 🎯 Project Objective: `{meta.get('project_name', project_name)}`
+- **Intended Goal / Problem Statement**:
+  {obj}
+- **Lifecycle Status**: `{status}`
+- **Primary Language**: {meta.get('primary_language', 'N/A')}
+- **GitHub Remote**: {meta.get('git_remote', 'N/A')}
+- **Git Sync State**: {'✅ Clean' if meta.get('is_synced') else '⚠️ Unsynced / Dirty'}
+"""
+                except Exception:
+                    pass
+            return f"Project '{project_name}' not found in catalog or Pinecone."
+
+        obj = proj.get("intended_objective", proj.get("consensus_summary", "No objective recorded."))
+        status = proj.get("project_status", "In Development")
+        next_steps = proj.get("next_steps", ["Continue development", "Review implementation"])
+        steps_str = "\n".join([f"  - {s}" for s in next_steps])
+
+        return f"""### 🎯 Project Objective: `{proj.get('project_name')}`
+- **Intended Goal / Problem Statement**:
+  {obj}
+- **Lifecycle Status**: `{status}`
+- **Primary Tech Stack**: {', '.join(proj.get('tech_stack', []))}
+- **GitHub Remote**: {proj.get('git_remote', 'N/A')}
+- **Git Branch**: `{proj.get('git_branch', 'main')}`
+- **Sync State**: {'✅ Clean / Synced' if proj.get('is_synced') else f'⚠️ Unsynced ({proj.get("unpushed_commits", 0)} unpushed, {proj.get("dirty_files_count", 0)} dirty)'}
+
+#### 📌 Recommended Next Steps to Achieve Objective:
+{steps_str}
 """
 
     return f"Tool '{tool_name}' executed."
