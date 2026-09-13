@@ -3,11 +3,12 @@
 Local Project Intelligence Scanner with Dual-Ollama Consensus & Central Pinecone DB Ingestion.
 
 Features:
+- Beautiful Rich CLI terminal interface with animated progress bars, live spinners, and summary tables.
 - Scans local directories for git repositories and projects.
 - Inspects git sync state (dirty files, unpushed commits, active branch, remotes).
 - Extracts READMEs, package configs, entry points.
 - Dual-Ollama multi-temperature consensus (qwen2.5:7b + llama3.2:latest at T=0.0, 0.5, 0.9).
-- Vectorizes with nomic-embed-text and upserts directly to Pinecone DB.
+- Vectorizes with nomic-embed-text (768-dim) and upserts directly to Pinecone DB.
 - Syncs with Vercel FastAPI MCP server.
 """
 
@@ -17,8 +18,9 @@ import json
 import glob
 import subprocess
 import datetime
+import time
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 import urllib.request
 import urllib.error
 
@@ -39,6 +41,66 @@ SYNC_SECRET = os.environ.get("SYNC_SECRET", "dev-sync-key")
 
 MODELS = ["qwen2.5:7b", "llama3.2:latest"]
 TEMPERATURES = [0.0, 0.5, 0.9]
+
+# Try importing Rich for elite terminal UI
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.progress import (
+        Progress,
+        SpinnerColumn,
+        BarColumn,
+        TextColumn,
+        TaskProgressColumn,
+        TimeElapsedColumn,
+        TimeRemainingColumn,
+    )
+    from rich.table import Table
+    from rich.text import Text
+    from rich import box
+    RICH_AVAILABLE = True
+    console = Console()
+except ImportError:
+    RICH_AVAILABLE = False
+    console = None
+
+def log_info(msg: str):
+    if RICH_AVAILABLE:
+        console.print(f"[cyan]ℹ[/cyan] {msg}")
+    else:
+        print(f"[*] {msg}")
+
+def log_success(msg: str):
+    if RICH_AVAILABLE:
+        console.print(f"[bold green]✔[/bold green] {msg}")
+    else:
+        print(f"[+] {msg}")
+
+def log_warn(msg: str):
+    if RICH_AVAILABLE:
+        console.print(f"[bold yellow]⚠[/bold yellow] {msg}")
+    else:
+        print(f"[!] {msg}")
+
+def log_error(msg: str):
+    if RICH_AVAILABLE:
+        console.print(f"[bold red]✖[/bold red] {msg}")
+    else:
+        print(f"[-] {msg}")
+
+def print_header():
+    if RICH_AVAILABLE:
+        header_text = (
+            "[bold cyan]Project Intelligence Scanner & Pinecone Ingester[/bold cyan]\n"
+            f"[dim]Dual-Ollama Consensus ({', '.join(MODELS)}) | 768-dim Embeddings[/dim]\n"
+            f"[dim]Central Cloud Storage: Pinecone DB Index: [bold]{PINECONE_INDEX_NAME}[/bold][/dim]"
+        )
+        console.print(Panel(header_text, box=box.ROUNDED, border_style="cyan", expand=False))
+    else:
+        print("=" * 60)
+        print("Project Intelligence Scanner & Pinecone Ingester")
+        print(f"Models: {', '.join(MODELS)} | Storage: Pinecone ({PINECONE_INDEX_NAME})")
+        print("=" * 60)
 
 def run_cmd(cmd: List[str], cwd: str) -> Optional[str]:
     try:
@@ -171,7 +233,6 @@ def call_ollama_generate(model: str, prompt: str, temperature: float) -> str:
             data = json.loads(resp.read().decode("utf-8"))
             return data.get("response", "").strip()
     except Exception as e:
-        print(f"Warning: Ollama generate ({model}, T={temperature}) failed: {e}")
         return ""
 
 def call_ollama_embed(text: str) -> List[float]:
@@ -190,11 +251,9 @@ def call_ollama_embed(text: str) -> List[float]:
             data = json.loads(resp.read().decode("utf-8"))
             return data.get("embedding", [0.0] * 768)
     except Exception as e:
-        print(f"Warning: Ollama embeddings failed: {e}")
         return [0.0] * 768
 
-def run_dual_ollama_consensus(ctx: Dict[str, Any]) -> str:
-    """Runs 6 generation passes across qwen2.5 and llama3.2 at T=0.0, 0.5, 0.9 and computes consensus."""
+def run_dual_ollama_consensus(ctx: Dict[str, Any], progress_cb=None) -> str:
     prompt = f"""You are an expert code intelligence evaluator. Summarize the following project concisely in 2 sentences.
 Focus strictly on the actual purpose, technology stack, and architecture shown in the files. Do not invent features.
 
@@ -206,19 +265,22 @@ README Preview:
 {ctx['readme_preview'][:1000]}
 """
     responses = []
-    print(f"  🤖 Running Dual-Ollama multi-temperature consensus (6 passes)...")
+    total_passes = len(MODELS) * len(TEMPERATURES)
+    current_pass = 0
+
     for model in MODELS:
         for temp in TEMPERATURES:
+            current_pass += 1
+            if progress_cb:
+                progress_cb(current_pass, total_passes, f"{model} (T={temp})")
             out = call_ollama_generate(model, prompt, temp)
             if out:
                 responses.append(out)
 
     if not responses:
-        # Fallback if Ollama models unavailable
         return f"{ctx['project_name']} is a {ctx['primary_language']} project containing {', '.join(ctx['top_files'][:5])}."
 
-    # Consensus Selection: Choose response with highest cross-model keyword agreement
-    # and closest alignment with factual tech tokens
+    # Consensus Selection
     best_candidate = responses[0]
     best_score = -1
     keywords = set(ctx['top_files'] + ctx['tech_stack'] + [ctx['project_name'].lower()])
@@ -226,14 +288,12 @@ README Preview:
     for cand in responses:
         cand_lower = cand.lower()
         score = sum(1 for kw in keywords if kw.lower() in cand_lower)
-        # Prefer moderate length sentences without preamble
         if "here is" in cand_lower or "based on" in cand_lower:
             score -= 1
         if score > best_score:
             best_score = score
             best_candidate = cand
 
-    # Clean up standard LLM chatter
     clean_summary = best_candidate.replace("Here is a 2-sentence summary:", "").strip()
     return clean_summary
 
@@ -245,68 +305,26 @@ def calculate_priority_score(git_info: Dict[str, Any]) -> int:
     score += min(git_info.get("dirty_files_count", 0) * 2, 10)
     return min(max(score, 1), 100)
 
-def scan_repository(repo_path: str) -> Dict[str, Any]:
-    print(f"🔍 Scanning: {repo_path}")
-    git_info = inspect_git_status(repo_path)
-    ctx = extract_project_context(repo_path)
-    
-    summary = run_dual_ollama_consensus(ctx)
-    priority = calculate_priority_score(git_info)
-    
-    # Generate embedding vector
-    vector_text = f"Project: {ctx['project_name']}. {summary} Stack: {', '.join(ctx['tech_stack'])}"
-    embedding = call_ollama_embed(vector_text)
-
-    project_data = {
-        "project_name": ctx["project_name"],
-        "primary_language": ctx["primary_language"],
-        "tech_stack": ctx["tech_stack"],
-        "git_remote": git_info["git_remote"],
-        "git_branch": git_info["git_branch"],
-        "is_synced": git_info["is_synced"],
-        "unpushed_commits": git_info["unpushed_commits"],
-        "dirty_files_count": git_info["dirty_files_count"],
-        "last_commit_date": git_info["last_commit_date"],
-        "priority_score": priority,
-        "consensus_summary": summary,
-        "key_files": ctx["top_files"],
-        "embedding_dim": len(embedding),
-        "last_scanned": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "chunks": [
-            {
-                "id": f"{ctx['project_name']}:overview",
-                "text": summary,
-                "type": "consensus_summary"
-            },
-            {
-                "id": f"{ctx['project_name']}:readme",
-                "text": ctx["readme_preview"][:800],
-                "type": "readme_chunk"
-            }
-        ]
-    }
-    return project_data, embedding
-
-def upsert_to_pinecone(projects: List[Dict[str, Any]], embeddings: List[List[float]]):
+def upsert_to_pinecone(projects: List[Dict[str, Any]], embeddings: List[List[float]]) -> bool:
     """Upserts projects and embeddings to Pinecone DB."""
     if not PINECONE_API_KEY:
-        print("ℹ️ PINECONE_API_KEY not set; skipping direct cloud vector upsert.")
+        log_warn("PINECONE_API_KEY not set; skipping direct cloud vector upsert.")
         return False
     try:
-        from pinecone import Pinecone
+        from pinecone import Pinecone, ServerlessSpec
         pc = Pinecone(api_key=PINECONE_API_KEY)
         
-        # Check or create index
         active_indexes = [i.name for i in pc.list_indexes()]
         if PINECONE_INDEX_NAME not in active_indexes:
-            print(f"Creating Pinecone index: {PINECONE_INDEX_NAME} (dimension=768)...")
-            from pinecone import ServerlessSpec
+            log_info(f"Creating Pinecone index: {PINECONE_INDEX_NAME} (dimension=768)...")
             pc.create_index(
                 name=PINECONE_INDEX_NAME,
                 dimension=768,
                 metric="cosine",
                 spec=ServerlessSpec(cloud="aws", region="us-east-1")
             )
+            while not pc.describe_index(PINECONE_INDEX_NAME).status['ready']:
+                time.sleep(2)
         
         index = pc.Index(PINECONE_INDEX_NAME)
         vectors_to_upsert = []
@@ -330,13 +348,12 @@ def upsert_to_pinecone(projects: List[Dict[str, Any]], embeddings: List[List[flo
             })
 
         index.upsert(vectors=vectors_to_upsert)
-        print(f"✅ Successfully upserted {len(vectors_to_upsert)} project vectors to Pinecone DB!")
         return True
     except Exception as e:
-        print(f"❌ Pinecone upsert error: {e}")
+        log_error(f"Pinecone upsert error: {e}")
         return False
 
-def sync_to_vercel_mcp(projects: List[Dict[str, Any]]):
+def sync_to_vercel_mcp(projects: List[Dict[str, Any]]) -> bool:
     """Syncs project profiles to the Vercel FastAPI MCP server."""
     endpoint = f"{VERCEL_MCP_URL}/api/sync"
     try:
@@ -352,43 +369,225 @@ def sync_to_vercel_mcp(projects: List[Dict[str, Any]]):
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
             res = json.loads(resp.read().decode("utf-8"))
-            print(f"✅ Synced {res.get('synced_count', 0)} projects to Vercel MCP server ({endpoint})!")
             return True
-    except Exception as e:
-        print(f"ℹ️ Could not sync directly to Vercel endpoint ({endpoint}): {e}")
+    except Exception:
         return False
 
-def main():
-    target_dirs = sys.argv[1:] if len(sys.argv) > 1 else ["/home/bhupendra/.gemini/antigravity-ide/scratch"]
-    
-    all_projects = []
-    all_embeddings = []
+def render_summary_table(projects: List[Dict[str, Any]], pinecone_ok: bool):
+    if not RICH_AVAILABLE:
+        print("\n" + "=" * 80)
+        print(f"{'PROJECT':<25} {'LANG':<12} {'SYNC':<10} {'UNPUSHED':<10} {'PRIORITY':<10}")
+        print("-" * 80)
+        for p in projects:
+            sync_txt = "CLEAN" if p['is_synced'] else "DIRTY"
+            print(f"{p['project_name']:<25} {p['primary_language']:<12} {sync_txt:<10} {p['unpushed_commits']:<10} {p['priority_score']}/100")
+        print("=" * 80)
+        return
 
+    table = Table(
+        title="✨ Scanned Projects Intelligence Catalog",
+        box=box.ROUNDED,
+        header_style="bold cyan",
+        title_style="bold green",
+        show_lines=True
+    )
+    table.add_column("Repository", style="bold white", width=22)
+    table.add_column("Tech Stack", style="cyan", width=20)
+    table.add_column("Branch", style="dim", width=10)
+    table.add_column("Git Sync", justify="center", width=12)
+    table.add_column("Unpushed", justify="center", width=10)
+    table.add_column("Priority", justify="center", width=12)
+    table.add_column("Pinecone RAG", justify="center", width=14)
+
+    for p in projects:
+        # Git Sync Badge
+        if p["is_synced"]:
+            sync_badge = "[bold green]🟢 Synced[/bold green]"
+        elif p["unpushed_commits"] > 0:
+            sync_badge = f"[bold yellow]🟡 {p['unpushed_commits']} unpushed[/bold yellow]"
+        else:
+            sync_badge = f"[bold red]🔴 {p['dirty_files_count']} dirty[/bold red]"
+
+        # Priority Color Coding
+        score = p["priority_score"]
+        if score >= 75:
+            p_text = f"[bold red]{score}/100 ⚡[/bold red]"
+        elif score >= 50:
+            p_text = f"[bold yellow]{score}/100[/bold yellow]"
+        else:
+            p_text = f"[bold green]{score}/100[/bold green]"
+
+        pinecone_badge = "[bold green]✔ Ingested[/bold green]" if pinecone_ok else "[dim]Cached[/dim]"
+        stack_str = ", ".join(p["tech_stack"][:3]) if p["tech_stack"] else p["primary_language"]
+
+        table.add_row(
+            p["project_name"],
+            stack_str,
+            p["git_branch"],
+            sync_badge,
+            str(p["unpushed_commits"]),
+            p_text,
+            pinecone_badge
+        )
+
+    console.print(table)
+
+def main():
+    print_header()
+    target_dirs = sys.argv[1:] if len(sys.argv) > 1 else ["/home/bhupendra/.gemini/antigravity-ide/scratch"]
+
+    # Discover candidate project directories
+    candidate_paths = []
     for base_dir in target_dirs:
         if not os.path.exists(base_dir):
             continue
-        print(f"\n📂 Scanning directory root: {base_dir}")
-        for item in os.listdir(base_dir):
+        # If target directory is itself a git repository, scan it directly
+        if os.path.isdir(os.path.join(base_dir, ".git")):
+            candidate_paths.append(base_dir)
+            continue
+        for item in sorted(os.listdir(base_dir)):
             full_path = os.path.join(base_dir, item)
             if os.path.isdir(full_path) and not item.startswith("."):
-                try:
-                    proj, emb = scan_repository(full_path)
-                    all_projects.append(proj)
-                    all_embeddings.append(emb)
-                except Exception as e:
-                    print(f"Error scanning {full_path}: {e}")
+                candidate_paths.append(full_path)
+
+    if not candidate_paths:
+        log_warn("No project directories found to scan.")
+        return
+
+    log_info(f"Discovered [bold]{len(candidate_paths)}[/bold] candidate repositories across: {', '.join(target_dirs)}")
+
+    all_projects = []
+    all_embeddings = []
+
+    if RICH_AVAILABLE:
+        with Progress(
+            SpinnerColumn("dots", style="cyan"),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(bar_width=35, style="dim white", complete_style="bold green"),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            console=console
+        ) as progress:
+            total_task = progress.add_task("[bold cyan]Scanning Repositories...", total=len(candidate_paths))
+            sub_task = progress.add_task("[dim]Initializing consensus...", total=6)
+
+            for repo_path in candidate_paths:
+                repo_name = os.path.basename(repo_path)
+                progress.update(total_task, description=f"[bold cyan]Scanning:[/bold cyan] [yellow]{repo_name}[/yellow]")
+                progress.reset(sub_task)
+
+                git_info = inspect_git_status(repo_path)
+                ctx = extract_project_context(repo_path)
+
+                def update_sub_task(current, total, model_info):
+                    progress.update(
+                        sub_task,
+                        total=total,
+                        completed=current,
+                        description=f"  [dim cyan]Dual-Ollama:[/dim cyan] [white]{model_info}[/white]"
+                    )
+
+                summary = run_dual_ollama_consensus(ctx, progress_cb=update_sub_task)
+                priority = calculate_priority_score(git_info)
+
+                # Embedding
+                progress.update(sub_task, description=f"  [dim green]Computing 768-dim embedding...[/dim green]")
+                vector_text = f"Project: {ctx['project_name']}. {summary} Stack: {', '.join(ctx['tech_stack'])}"
+                embedding = call_ollama_embed(vector_text)
+
+                proj_data = {
+                    "project_name": ctx["project_name"],
+                    "primary_language": ctx["primary_language"],
+                    "tech_stack": ctx["tech_stack"],
+                    "git_remote": git_info["git_remote"],
+                    "git_branch": git_info["git_branch"],
+                    "is_synced": git_info["is_synced"],
+                    "unpushed_commits": git_info["unpushed_commits"],
+                    "dirty_files_count": git_info["dirty_files_count"],
+                    "last_commit_date": git_info["last_commit_date"],
+                    "priority_score": priority,
+                    "consensus_summary": summary,
+                    "key_files": ctx["top_files"],
+                    "embedding_dim": len(embedding),
+                    "last_scanned": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "chunks": [
+                        {"id": f"{ctx['project_name']}:overview", "text": summary, "type": "consensus_summary"},
+                        {"id": f"{ctx['project_name']}:readme", "text": ctx["readme_preview"][:800], "type": "readme_chunk"}
+                    ]
+                }
+                all_projects.append(proj_data)
+                all_embeddings.append(embedding)
+
+                progress.advance(total_task)
+
+            progress.update(sub_task, visible=False)
+    else:
+        for idx, repo_path in enumerate(candidate_paths, 1):
+            repo_name = os.path.basename(repo_path)
+            print(f"\n[{idx}/{len(candidate_paths)}] Scanning {repo_name}...")
+            git_info = inspect_git_status(repo_path)
+            ctx = extract_project_context(repo_path)
+            summary = run_dual_ollama_consensus(ctx)
+            priority = calculate_priority_score(git_info)
+            vector_text = f"Project: {ctx['project_name']}. {summary} Stack: {', '.join(ctx['tech_stack'])}"
+            embedding = call_ollama_embed(vector_text)
+            all_projects.append({
+                "project_name": ctx["project_name"],
+                "primary_language": ctx["primary_language"],
+                "tech_stack": ctx["tech_stack"],
+                "git_remote": git_info["git_remote"],
+                "git_branch": git_info["git_branch"],
+                "is_synced": git_info["is_synced"],
+                "unpushed_commits": git_info["unpushed_commits"],
+                "dirty_files_count": git_info["dirty_files_count"],
+                "last_commit_date": git_info["last_commit_date"],
+                "priority_score": priority,
+                "consensus_summary": summary,
+                "key_files": ctx["top_files"],
+                "embedding_dim": len(embedding),
+                "last_scanned": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "chunks": [
+                    {"id": f"{ctx['project_name']}:overview", "text": summary, "type": "consensus_summary"}
+                ]
+            })
+            all_embeddings.append(embedding)
 
     # Save to local cache
     cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "projects_cache.json")
     with open(cache_path, "w", encoding="utf-8") as f:
         json.dump({"projects": all_projects}, f, indent=2)
-    print(f"\n💾 Saved {len(all_projects)} project intelligence profiles to {cache_path}")
+    log_success(f"Saved local cache to [underline]{cache_path}[/underline]")
 
-    # Upsert to Pinecone
-    upsert_to_pinecone(all_projects, all_embeddings)
+    # Pinecone Upsert
+    if RICH_AVAILABLE:
+        with console.status("[bold cyan]Upserting vector embeddings to Pinecone DB...", spinner="aesthetic"):
+            pinecone_ok = upsert_to_pinecone(all_projects, all_embeddings)
+    else:
+        pinecone_ok = upsert_to_pinecone(all_projects, all_embeddings)
 
-    # Sync to Vercel Serverless MCP
+    if pinecone_ok:
+        log_success(f"Successfully upserted [bold green]{len(all_projects)}[/bold green] vectors to Pinecone Index ([cyan]{PINECONE_INDEX_NAME}[/cyan])!")
+    else:
+        log_warn("Pinecone DB upsert completed in offline/cache mode.")
+
+    # Vercel Sync
     sync_to_vercel_mcp(all_projects)
+
+    # Render Final Rich Dashboard Table
+    console.print()
+    render_summary_table(all_projects, pinecone_ok)
+
+    # Final Stats Panel
+    synced_count = sum(1 for p in all_projects if p["is_synced"])
+    dirty_count = len(all_projects) - synced_count
+    if RICH_AVAILABLE:
+        stats_text = (
+            f"[bold]Total Repositories:[/bold] {len(all_projects)} | "
+            f"[bold green]Fully Synced:[/bold green] {synced_count} | "
+            f"[bold yellow]Requiring Attention:[/bold yellow] {dirty_count} | "
+            f"[bold cyan]Pinecone Vectors:[/bold cyan] {len(all_projects)}"
+        )
+        console.print(Panel(stats_text, title="📊 Ingestion Summary", border_style="green", expand=False))
 
 if __name__ == "__main__":
     main()
