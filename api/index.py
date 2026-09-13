@@ -11,6 +11,15 @@ app = FastAPI(
     version="2.0.0"
 )
 
+# Auto-load .env file if present
+env_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+if os.path.exists(env_file):
+    with open(env_file) as f:
+        for line in f:
+            if "=" in line and not line.strip().startswith("#"):
+                k, v = line.strip().split("=", 1)
+                os.environ.setdefault(k, v.strip("\"'"))
+
 # Configuration
 PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY", "")
 PINECONE_INDEX_NAME = os.environ.get("PINECONE_INDEX_NAME", "project-intelligence")

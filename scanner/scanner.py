@@ -22,6 +22,15 @@ from typing import Dict, List, Any, Optional
 import urllib.request
 import urllib.error
 
+# Auto-load .env file if present
+env_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+if os.path.exists(env_file):
+    with open(env_file) as f:
+        for line in f:
+            if "=" in line and not line.strip().startswith("#"):
+                k, v = line.strip().split("=", 1)
+                os.environ.setdefault(k, v.strip("\"'"))
+
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY", "")
 PINECONE_INDEX_NAME = os.environ.get("PINECONE_INDEX_NAME", "project-intelligence")
